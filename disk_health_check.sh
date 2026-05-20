@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-# Disk Health Check Script v2.3
+# Disk Health Check Script v2.4
 # Author: For Hung (VPNNGA.COM / Dataz.vn)
 # Mục đích: Check toàn diện sức khỏe và thông số disk trên Linux server/VPS
 # Hỗ trợ: Debian/Ubuntu, RHEL/CentOS/Rocky, Arch, Alpine
@@ -23,15 +23,17 @@ TEMP_CRIT=60
 FULL_MODE=0
 JSON_MODE=0
 NO_COLOR=0
+DEBUG_MODE=0
 for arg in "$@"; do
     case "$arg" in
         --full)     FULL_MODE=1 ;;
         --json)     JSON_MODE=1 ;;
         --no-color) NO_COLOR=1 ;;
+        --debug)    DEBUG_MODE=1 ;;
         -h|--help)
-            echo "Usage: $0 [--full] [--json] [--no-color]"
+            echo "Usage: $0 [--full] [--debug] [--no-color]"
             echo "  --full     : Quét thêm top thư mục chiếm dung lượng (chậm)"
-            echo "  --json     : Output dạng JSON (chưa đầy đủ)"
+            echo "  --debug    : Dump raw SMART output (debug parse)"
             echo "  --no-color : Tắt màu (dùng khi pipe ra file)"
             exit 0
             ;;
@@ -414,6 +416,11 @@ show_smart_raid() {
             rotation=$(echo "$out" | grep -iE "Rotation Rate" | head -1 | awk -F: '{print $2}' | xargs)
 
             echo -e "${YELLOW}● ${dev} -d ${RAID_TYPE},${i}${NC}"
+            if [ "$DEBUG_MODE" -eq 1 ]; then
+                echo -e "${CYAN}    [DEBUG] Raw SMART -A output:${NC}"
+                echo "$attrs" | sed 's/^/    | /'
+                echo ""
+            fi
             [ -n "$model" ]  && echo "    Model        : $model"
             [ -n "$serial" ] && echo "    Serial       : $serial"
             [ -n "$size" ]   && echo "    Size         : $size"
@@ -434,12 +441,40 @@ show_smart_raid() {
             poh=$(echo "$attrs" | grep -iE "Power_On_Hours|Power On Hours" | awk '{print $NF}' | head -1 | tr -d ',')
             [ -n "$poh" ] && [[ "$poh" =~ ^[0-9]+$ ]] && echo "    Power On     : $poh giờ (~$((poh/24)) ngày)"
 
-            temp=$(echo "$attrs" | grep -iE "Temperature_Celsius|Current Drive Temperature|Temperature:" | awk '{for(i=1;i<=NF;i++) if($i~/^[0-9]+$/ && $i+0<100 && $i+0>10){print $i; exit}}' | head -1)
-            if [ -n "$temp" ] && [[ "$temp" =~ ^[0-9]+$ ]]; then
-                if [ "$temp" -ge "$TEMP_CRIT" ]; then
+            # Parse temp chuẩn theo từng định dạng output
+            # Format 1: "194 Temperature_Celsius ... 070 ..." (cột RAW_VALUE thường cột 10)
+            # Format 2: "Temperature:                        45 C"
+            # Format 3: "Current Drive Temperature:     45 C"
+            temp=""
+            # Thử format SCSI/SAS "Current Drive Temperature: 45 C"
+            temp=$(echo "$attrs" | grep -iE "Current Drive Temperature|Drive Temperature" | grep -oE "[0-9]+ C" | head -1 | awk '{print $1}')
+            # Thử format NVMe-like "Temperature: 45 Celsius"
+            if [ -z "$temp" ]; then
+                temp=$(echo "$attrs" | grep -iE "^Temperature:" | grep -oE "[0-9]+" | head -1)
+            fi
+            # Thử ATA SMART attribute 194 Temperature_Celsius - cột thứ 10 là raw value
+            if [ -z "$temp" ]; then
+                # Dòng dạng: "194 Temperature_Celsius     0x0022   200   200   000    Old_age   Always       -       28"
+                # Cột cuối là raw, nhưng có khi có thêm "(Min/Max 25/45)" nên lấy số đầu của cột raw
+                temp=$(echo "$attrs" | grep -iE "^[[:space:]]*(190|194)[[:space:]].*Temperature" | awk '{print $10}' | head -1 | grep -oE "^[0-9]+")
+            fi
+            # Thử Airflow_Temperature_Cel (attr 190)
+            if [ -z "$temp" ]; then
+                temp=$(echo "$attrs" | grep -iE "Airflow_Temperature" | awk '{print $10}' | head -1 | grep -oE "^[0-9]+")
+            fi
+
+            # Loại bỏ leading zero để bash so sánh đúng (070 -> 70)
+            temp=$(echo "$temp" | sed 's/^0*//')
+            [ -z "$temp" ] && temp=0
+
+            if [ -n "$temp" ] && [[ "$temp" =~ ^[0-9]+$ ]] && [ "$temp" -gt 0 ]; then
+                # Sanity check: nhiệt độ disk thực tế trong khoảng 15-90°C
+                if [ "$temp" -lt 10 ] || [ "$temp" -gt 100 ]; then
+                    echo -e "    Temperature  : ${YELLOW}${temp}°C (giá trị bất thường - có thể parse sai)${NC}"
+                elif [ "$temp" -ge "$TEMP_CRIT" ]; then
                     echo -e "    Temperature  : ${RED}${temp}°C ⚠ QUÁ NÓNG${NC}"
                 elif [ "$temp" -ge "$TEMP_WARN" ]; then
-                    echo -e "    Temperature  : ${YELLOW}${temp}°C${NC}"
+                    echo -e "    Temperature  : ${YELLOW}${temp}°C cao${NC}"
                 else
                     echo -e "    Temperature  : ${GREEN}${temp}°C ✓${NC}"
                 fi
@@ -757,7 +792,7 @@ show_summary() {
 main() {
     echo -e "${BOLD}${CYAN}"
     echo "╔════════════════════════════════════════════════════════════════════╗"
-    echo "║       DISK HEALTH CHECK v2.3 - Linux Server/VPS Monitor           ║"
+    echo "║       DISK HEALTH CHECK v2.4 - Linux Server/VPS Monitor           ║"
     echo "╚════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
