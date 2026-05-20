@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-# Disk Health Check Script v2.2
+# Disk Health Check Script v2.3
 # Author: For Hung (VPNNGA.COM / Dataz.vn)
 # Mục đích: Check toàn diện sức khỏe và thông số disk trên Linux server/VPS
 # Hỗ trợ: Debian/Ubuntu, RHEL/CentOS/Rocky, Arch, Alpine
@@ -280,11 +280,14 @@ show_system_info() {
     echo -e "Kernel       : ${GREEN}$(uname -r)${NC}"
     echo -e "Kiến trúc    : ${GREEN}$(uname -m)${NC}"
 
-    if [ "$VIRT_TYPE" != "none" ] && [ -n "$VIRT_TYPE" ]; then
-        printf "Ảo hoá       : ${YELLOW}%s${NC} (một số check SMART có thể không khả dụng)\n" "$VIRT_TYPE"
-    else
-        printf "Ảo hoá       : ${GREEN}bare-metal / không phát hiện${NC}\n"
-    fi
+    case "$VIRT_TYPE" in
+        none|"")
+            echo -e "Ảo hoá       : ${GREEN}bare-metal / không phát hiện${NC}"
+            ;;
+        *)
+            echo -e "Ảo hoá       : ${YELLOW}${VIRT_TYPE}${NC}"
+            ;;
+    esac
 
     echo -e "Uptime       : ${GREEN}$(uptime -p 2>/dev/null || uptime)${NC}"
     echo -e "Thời gian    : ${GREEN}$(date '+%Y-%m-%d %H:%M:%S %Z')${NC}"
@@ -361,6 +364,104 @@ show_disk_usage() {
 # ============================================================
 # 4. SMART HEALTH
 # ============================================================
+# Detect RAID controller (Dell PERC, LSI MegaRAID, HP SmartArray)
+detect_raid_controller() {
+    RAID_TYPE=""
+    RAID_DEVICE=""
+
+    # Check qua lspci nếu có
+    if command -v lspci &>/dev/null; then
+        local pci_info
+        pci_info=$(lspci 2>/dev/null | grep -iE "raid|megaraid|perc|smart array|hpsa")
+        if echo "$pci_info" | grep -qi "megaraid\|perc"; then
+            RAID_TYPE="megaraid"
+        elif echo "$pci_info" | grep -qi "smart array\|hpsa"; then
+            RAID_TYPE="cciss"
+        fi
+    fi
+
+    # Backup: detect qua model name của disk
+    if [ -z "$RAID_TYPE" ]; then
+        for disk in $(lsblk -d -n -o NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do
+            local model
+            model=$(cat /sys/block/"$disk"/device/model 2>/dev/null | xargs)
+            if echo "$model" | grep -qiE "PERC|MegaRAID"; then
+                RAID_TYPE="megaraid"
+                RAID_DEVICE="/dev/$disk"
+                break
+            fi
+        done
+    fi
+}
+
+# Đọc SMART qua RAID controller
+show_smart_raid() {
+    local dev="$1"
+    echo -e "${CYAN}→ Phát hiện RAID controller (${RAID_TYPE}). Quét disk vật lý phía sau...${NC}"
+    echo ""
+
+    local found=0
+    # Thử các disk ID từ 0 đến 23 (đủ cho hầu hết server)
+    for i in $(seq 0 23); do
+        local out
+        out=$(smartctl -d "${RAID_TYPE},$i" -i "$dev" 2>/dev/null)
+        if echo "$out" | grep -qiE "Device Model|Product:|Model Number"; then
+            found=1
+            local model serial size rotation
+            model=$(echo "$out" | grep -iE "Device Model|Product:|Model Number" | head -1 | awk -F: '{print $2}' | xargs)
+            serial=$(echo "$out" | grep -iE "Serial [Nn]umber" | head -1 | awk -F: '{print $2}' | xargs)
+            size=$(echo "$out" | grep -iE "User Capacity" | head -1 | sed -E 's/.*\[([^]]+)\].*/\1/')
+            rotation=$(echo "$out" | grep -iE "Rotation Rate" | head -1 | awk -F: '{print $2}' | xargs)
+
+            echo -e "${YELLOW}● ${dev} -d ${RAID_TYPE},${i}${NC}"
+            [ -n "$model" ]  && echo "    Model        : $model"
+            [ -n "$serial" ] && echo "    Serial       : $serial"
+            [ -n "$size" ]   && echo "    Size         : $size"
+            [ -n "$rotation" ] && echo "    Rotation     : $rotation"
+
+            # Health
+            local health
+            health=$(smartctl -d "${RAID_TYPE},$i" -H "$dev" 2>/dev/null | grep -iE "SMART overall|SMART Health Status" | awk -F: '{print $2}' | xargs)
+            if [[ "$health" =~ ^(PASSED|OK)$ ]]; then
+                echo -e "    SMART Status : ${GREEN}$health ✓${NC}"
+            elif [ -n "$health" ]; then
+                echo -e "    SMART Status : ${RED}$health ✗${NC}"
+            fi
+
+            # Attributes
+            local attrs poh temp realloc
+            attrs=$(smartctl -d "${RAID_TYPE},$i" -A "$dev" 2>/dev/null)
+            poh=$(echo "$attrs" | grep -iE "Power_On_Hours|Power On Hours" | awk '{print $NF}' | head -1 | tr -d ',')
+            [ -n "$poh" ] && [[ "$poh" =~ ^[0-9]+$ ]] && echo "    Power On     : $poh giờ (~$((poh/24)) ngày)"
+
+            temp=$(echo "$attrs" | grep -iE "Temperature_Celsius|Current Drive Temperature|Temperature:" | awk '{for(i=1;i<=NF;i++) if($i~/^[0-9]+$/ && $i+0<100 && $i+0>10){print $i; exit}}' | head -1)
+            if [ -n "$temp" ] && [[ "$temp" =~ ^[0-9]+$ ]]; then
+                if [ "$temp" -ge "$TEMP_CRIT" ]; then
+                    echo -e "    Temperature  : ${RED}${temp}°C ⚠ QUÁ NÓNG${NC}"
+                elif [ "$temp" -ge "$TEMP_WARN" ]; then
+                    echo -e "    Temperature  : ${YELLOW}${temp}°C${NC}"
+                else
+                    echo -e "    Temperature  : ${GREEN}${temp}°C ✓${NC}"
+                fi
+            fi
+
+            realloc=$(echo "$attrs" | grep -i "Reallocated_Sector" | awk '{print $NF}' | head -1)
+            if [ -n "$realloc" ] && [ "$realloc" != "0" ]; then
+                echo -e "    Bad Sectors  : ${RED}$realloc (đã có sector lỗi!)${NC}"
+            elif [ -n "$realloc" ]; then
+                echo -e "    Bad Sectors  : ${GREEN}0 ✓${NC}"
+            fi
+
+            echo ""
+        fi
+    done
+
+    if [ "$found" -eq 0 ]; then
+        echo -e "${YELLOW}⚠ Không tìm thấy disk nào phía sau RAID controller${NC}"
+        echo -e "${YELLOW}  Thử thủ công: smartctl --scan${NC}"
+    fi
+}
+
 show_smart_info() {
     print_header "4. SMART HEALTH CHECK"
 
@@ -368,6 +469,9 @@ show_smart_info() {
         echo -e "${YELLOW}⚠ smartctl chưa cài. Cài bằng: sudo $PKG_INSTALL smartmontools${NC}"
         return
     fi
+
+    # Detect RAID controller
+    detect_raid_controller
 
     # Cảnh báo trên môi trường ảo
     case "$VIRT_TYPE" in
@@ -391,6 +495,14 @@ show_smart_info() {
             continue
         fi
 
+        # Check RAID controller - đọc qua megaraid/cciss
+        local model_check
+        model_check=$(cat /sys/block/"$disk"/device/model 2>/dev/null | xargs)
+        if echo "$model_check" | grep -qiE "PERC|MegaRAID|LOGICAL|SmartArray"; then
+            show_smart_raid "/dev/$disk"
+            continue
+        fi
+
         echo -e "${YELLOW}● /dev/$disk (${DISK_TYPE})${NC}"
 
         local args
@@ -400,7 +512,7 @@ show_smart_info() {
         health=$(smartctl $args -H /dev/"$disk" 2>/dev/null | grep -iE "SMART overall|SMART Health Status" | awk -F: '{print $2}' | xargs)
 
         if [ -z "$health" ]; then
-            echo -e "    SMART        : ${YELLOW}Không đọc được${NC}"
+            echo -e "    SMART        : ${YELLOW}Không đọc được (có thể là RAID controller, thử: smartctl --scan)${NC}"
             continue
         fi
 
@@ -503,7 +615,8 @@ show_io_stats() {
 
     if command -v iostat &>/dev/null; then
         print_sub "Disk I/O Statistics (mẫu 2 giây, đã lọc loop/ram)"
-        iostat -xh 2 2 2>/dev/null | tail -n +4 | grep -vE "^\s+(loop|ram|sr)[0-9]"
+        # Lọc bằng grep -v, match cả loop0, loop10, ram1, sr0...
+        iostat -xh 2 2 2>/dev/null | tail -n +4 | grep -vE '[[:space:]](loop|ram|sr)[0-9]+$'
     else
         echo -e "${YELLOW}⚠ iostat chưa cài. Cài bằng: sudo $PKG_INSTALL sysstat${NC}"
     fi
@@ -644,7 +757,7 @@ show_summary() {
 main() {
     echo -e "${BOLD}${CYAN}"
     echo "╔════════════════════════════════════════════════════════════════════╗"
-    echo "║       DISK HEALTH CHECK v2.2 - Linux Server/VPS Monitor           ║"
+    echo "║       DISK HEALTH CHECK v2.3 - Linux Server/VPS Monitor           ║"
     echo "╚════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
