@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-# Disk Health Check Script v2.4
+# Disk Health Check Script v2.6
 # Author: For Hung (VPNNGA.COM / Dataz.vn)
 # Mục đích: Check toàn diện sức khỏe và thông số disk trên Linux server/VPS
 # Hỗ trợ: Debian/Ubuntu, RHEL/CentOS/Rocky, Arch, Alpine
@@ -241,7 +241,19 @@ check_dependencies() {
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $PKG_NAMES >/dev/null 2>&1
             ;;
         rhel)
+            # Thử import GPG key mới nếu là AlmaLinux/Rocky (tránh lỗi GPG check FAILED)
+            if [ "$OS_ID" = "almalinux" ]; then
+                rpm --import https://repo.almalinux.org/almalinux/RPM-GPG-KEY-AlmaLinux 2>/dev/null
+                rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux 2>/dev/null
+            elif [ "$OS_ID" = "rocky" ]; then
+                rpm --import https://download.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial 2>/dev/null
+            fi
             $PKG_INSTALL $PKG_NAMES >/dev/null 2>&1
+            # Nếu vẫn lỗi do GPG, thử bypass
+            if ! command -v smartctl &>/dev/null; then
+                echo -e "${YELLOW}  Thử lại với --nogpgcheck...${NC}"
+                $PKG_INSTALL --nogpgcheck $PKG_NAMES >/dev/null 2>&1
+            fi
             ;;
         arch)
             pacman -Sy --noconfirm $PKG_NAMES >/dev/null 2>&1
@@ -366,33 +378,67 @@ show_disk_usage() {
 # ============================================================
 # 4. SMART HEALTH
 # ============================================================
-# Detect RAID controller (Dell PERC, LSI MegaRAID, HP SmartArray)
+# Detect RAID controller (Dell PERC, LSI MegaRAID, HP SmartArray, Fujitsu PRAID, Adaptec...)
 detect_raid_controller() {
     RAID_TYPE=""
     RAID_DEVICE=""
 
-    # Check qua lspci nếu có
+    # Pattern các loại RAID controller phổ biến:
+    # - megaraid: LSI/Broadcom MegaRAID, Dell PERC, Fujitsu PRAID, IBM ServeRAID, Lenovo
+    # - cciss: HP Smart Array (cũ)
+    # - aacraid: Adaptec
+    # - 3ware: 3ware/LSI 3ware
+    local megaraid_pattern="megaraid|perc|praid|servraid|serveraid|lsi|symbios|broadcom"
+    local hp_pattern="smart array|hpsa|hpe"
+    local adaptec_pattern="adaptec|aacraid"
+    local areca_pattern="areca"
+
+    # Check qua lspci
     if command -v lspci &>/dev/null; then
         local pci_info
-        pci_info=$(lspci 2>/dev/null | grep -iE "raid|megaraid|perc|smart array|hpsa")
-        if echo "$pci_info" | grep -qi "megaraid\|perc"; then
+        pci_info=$(lspci 2>/dev/null | grep -iE "raid|storage|scsi")
+        if echo "$pci_info" | grep -qiE "$megaraid_pattern"; then
             RAID_TYPE="megaraid"
-        elif echo "$pci_info" | grep -qi "smart array\|hpsa"; then
+        elif echo "$pci_info" | grep -qiE "$hp_pattern"; then
             RAID_TYPE="cciss"
+        elif echo "$pci_info" | grep -qiE "$adaptec_pattern"; then
+            RAID_TYPE="aacraid"
+        elif echo "$pci_info" | grep -qiE "$areca_pattern"; then
+            RAID_TYPE="areca"
         fi
     fi
 
     # Backup: detect qua model name của disk
     if [ -z "$RAID_TYPE" ]; then
         for disk in $(lsblk -d -n -o NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do
-            local model
+            local model vendor
             model=$(cat /sys/block/"$disk"/device/model 2>/dev/null | xargs)
-            if echo "$model" | grep -qiE "PERC|MegaRAID"; then
+            vendor=$(cat /sys/block/"$disk"/device/vendor 2>/dev/null | xargs)
+            local check_str="${vendor} ${model}"
+            if echo "$check_str" | grep -qiE "$megaraid_pattern"; then
                 RAID_TYPE="megaraid"
-                RAID_DEVICE="/dev/$disk"
+                break
+            elif echo "$check_str" | grep -qiE "$hp_pattern|smart\s+array"; then
+                RAID_TYPE="cciss"
+                break
+            elif echo "$check_str" | grep -qiE "$adaptec_pattern"; then
+                RAID_TYPE="aacraid"
                 break
             fi
         done
+    fi
+
+    # Backup 2: smartctl --scan thường list ra các disk phía sau RAID
+    if [ -z "$RAID_TYPE" ] && command -v smartctl &>/dev/null; then
+        local scan_out
+        scan_out=$(smartctl --scan 2>/dev/null)
+        if echo "$scan_out" | grep -q "megaraid"; then
+            RAID_TYPE="megaraid"
+        elif echo "$scan_out" | grep -q "cciss"; then
+            RAID_TYPE="cciss"
+        elif echo "$scan_out" | grep -q "aacraid"; then
+            RAID_TYPE="aacraid"
+        fi
     fi
 }
 
@@ -441,42 +487,49 @@ show_smart_raid() {
             poh=$(echo "$attrs" | grep -iE "Power_On_Hours|Power On Hours" | awk '{print $NF}' | head -1 | tr -d ',')
             [ -n "$poh" ] && [[ "$poh" =~ ^[0-9]+$ ]] && echo "    Power On     : $poh giờ (~$((poh/24)) ngày)"
 
-            # Parse temp chuẩn theo từng định dạng output
-            # Format 1: "194 Temperature_Celsius ... 070 ..." (cột RAW_VALUE thường cột 10)
-            # Format 2: "Temperature:                        45 C"
-            # Format 3: "Current Drive Temperature:     45 C"
+            # Parse nhiệt độ THẬT (RAW_VALUE) từ SMART output
+            # Format ATA: "194 Temperature_Celsius 0x0022 070 046 000 Old_age Always - 30 (Min/Max 22/54)"
+            # Cột RAW_VALUE nằm SAU dấu "-", không phải cột thứ 10 (cột 10 là VALUE normalized)
             temp=""
-            # Thử format SCSI/SAS "Current Drive Temperature: 45 C"
+
+            # Format 1: SCSI/SAS "Current Drive Temperature: 45 C"
             temp=$(echo "$attrs" | grep -iE "Current Drive Temperature|Drive Temperature" | grep -oE "[0-9]+ C" | head -1 | awk '{print $1}')
-            # Thử format NVMe-like "Temperature: 45 Celsius"
+
+            # Format 2: NVMe "Temperature: 45 Celsius"
             if [ -z "$temp" ]; then
                 temp=$(echo "$attrs" | grep -iE "^Temperature:" | grep -oE "[0-9]+" | head -1)
             fi
-            # Thử ATA SMART attribute 194 Temperature_Celsius - cột thứ 10 là raw value
+
+            # Format 3: ATA attr 194 Temperature_Celsius - lấy số ĐẦU TIÊN sau dấu "-"
             if [ -z "$temp" ]; then
-                # Dòng dạng: "194 Temperature_Celsius     0x0022   200   200   000    Old_age   Always       -       28"
-                # Cột cuối là raw, nhưng có khi có thêm "(Min/Max 25/45)" nên lấy số đầu của cột raw
-                temp=$(echo "$attrs" | grep -iE "^[[:space:]]*(190|194)[[:space:]].*Temperature" | awk '{print $10}' | head -1 | grep -oE "^[0-9]+")
-            fi
-            # Thử Airflow_Temperature_Cel (attr 190)
-            if [ -z "$temp" ]; then
-                temp=$(echo "$attrs" | grep -iE "Airflow_Temperature" | awk '{print $10}' | head -1 | grep -oE "^[0-9]+")
+                temp=$(echo "$attrs" | grep -iE "^[[:space:]]*194[[:space:]].*Temperature" | \
+                       sed -E 's/.*[[:space:]]-[[:space:]]+([0-9]+).*/\1/' | head -1)
             fi
 
-            # Loại bỏ leading zero để bash so sánh đúng (070 -> 70)
-            temp=$(echo "$temp" | sed 's/^0*//')
-            [ -z "$temp" ] && temp=0
+            # Format 4: ATA attr 190 Airflow_Temperature_Cel
+            if [ -z "$temp" ]; then
+                temp=$(echo "$attrs" | grep -iE "^[[:space:]]*190[[:space:]].*Airflow_Temperature" | \
+                       sed -E 's/.*[[:space:]]-[[:space:]]+([0-9]+).*/\1/' | head -1)
+            fi
 
-            if [ -n "$temp" ] && [[ "$temp" =~ ^[0-9]+$ ]] && [ "$temp" -gt 0 ]; then
-                # Sanity check: nhiệt độ disk thực tế trong khoảng 15-90°C
-                if [ "$temp" -lt 10 ] || [ "$temp" -gt 100 ]; then
-                    echo -e "    Temperature  : ${YELLOW}${temp}°C (giá trị bất thường - có thể parse sai)${NC}"
-                elif [ "$temp" -ge "$TEMP_CRIT" ]; then
-                    echo -e "    Temperature  : ${RED}${temp}°C ⚠ QUÁ NÓNG${NC}"
+            # Validate phải là số
+            if ! [[ "$temp" =~ ^[0-9]+$ ]]; then
+                temp=""
+            fi
+
+            if [ -n "$temp" ]; then
+                # Thêm Min/Max nếu có
+                local minmax
+                minmax=$(echo "$attrs" | grep -iE "Temperature_Celsius|Airflow_Temperature" | grep -oE "Min/Max [0-9]+/[0-9]+" | head -1)
+                local mm_suffix=""
+                [ -n "$minmax" ] && mm_suffix=" (${minmax})"
+
+                if [ "$temp" -ge "$TEMP_CRIT" ]; then
+                    echo -e "    Temperature  : ${RED}${temp}°C ⚠ QUÁ NÓNG${mm_suffix}${NC}"
                 elif [ "$temp" -ge "$TEMP_WARN" ]; then
-                    echo -e "    Temperature  : ${YELLOW}${temp}°C cao${NC}"
+                    echo -e "    Temperature  : ${YELLOW}${temp}°C cao${mm_suffix}${NC}"
                 else
-                    echo -e "    Temperature  : ${GREEN}${temp}°C ✓${NC}"
+                    echo -e "    Temperature  : ${GREEN}${temp}°C ✓${mm_suffix}${NC}"
                 fi
             fi
 
@@ -530,10 +583,14 @@ show_smart_info() {
             continue
         fi
 
-        # Check RAID controller - đọc qua megaraid/cciss
-        local model_check
+        # Check RAID controller - đọc qua megaraid/cciss/aacraid
+        local model_check vendor_check
         model_check=$(cat /sys/block/"$disk"/device/model 2>/dev/null | xargs)
-        if echo "$model_check" | grep -qiE "PERC|MegaRAID|LOGICAL|SmartArray"; then
+        vendor_check=$(cat /sys/block/"$disk"/device/vendor 2>/dev/null | xargs)
+        local raid_str="${vendor_check} ${model_check}"
+        if echo "$raid_str" | grep -qiE "PERC|MegaRAID|PRAID|ServeRAID|LOGICAL|SmartArray|Smart Array|HPSA|Adaptec|LSI|Areca|FTS"; then
+            # Nếu chưa set RAID_TYPE từ detect_raid_controller thì set fallback
+            [ -z "$RAID_TYPE" ] && RAID_TYPE="megaraid"
             show_smart_raid "/dev/$disk"
             continue
         fi
@@ -547,7 +604,16 @@ show_smart_info() {
         health=$(smartctl $args -H /dev/"$disk" 2>/dev/null | grep -iE "SMART overall|SMART Health Status" | awk -F: '{print $2}' | xargs)
 
         if [ -z "$health" ]; then
-            echo -e "    SMART        : ${YELLOW}Không đọc được (có thể là RAID controller, thử: smartctl --scan)${NC}"
+            echo -e "    SMART        : ${YELLOW}Không đọc được trực tiếp, đang thử qua RAID controller...${NC}"
+            # Fallback cuối: thử quét megaraid dù chưa detect được
+            local scan_devs
+            scan_devs=$(smartctl --scan 2>/dev/null | grep -oE "\-d [a-z]+" | sort -u | head -1 | awk '{print $2}')
+            if [ -n "$scan_devs" ]; then
+                RAID_TYPE="$scan_devs"
+                show_smart_raid "/dev/$disk"
+            else
+                echo -e "    ${YELLOW}Gợi ý: chạy \`smartctl --scan\` để xem các loại quét khả dụng${NC}"
+            fi
             continue
         fi
 
@@ -792,7 +858,7 @@ show_summary() {
 main() {
     echo -e "${BOLD}${CYAN}"
     echo "╔════════════════════════════════════════════════════════════════════╗"
-    echo "║       DISK HEALTH CHECK v2.4 - Linux Server/VPS Monitor           ║"
+    echo "║       DISK HEALTH CHECK v2.6 - Linux Server/VPS Monitor           ║"
     echo "╚════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
